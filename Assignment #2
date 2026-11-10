@@ -1,0 +1,372 @@
+# @title Generate all three Halley figures
+#!/usr/bin/env python3
+"""Generate the Halley figures from the existing assignment calculations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+# Source data: COBS, 1P/Halley, MPC Ephemeris Service, reference MPC191592,
+# page/element epoch 2026-10-29. MPC defines comet perihelion passage in TT.
+SOURCE_URL = "https://www.cobs.si/comet/479/"
+MPC_FORMAT_URL = "https://docs.minorplanetcenter.net/mpc-ops-docs/orbits/comet-orbit-format/"
+SOURCE_RETRIEVED = "2026-10-30"
+ELEMENT_EPOCH = datetime(2026, 10, 29, tzinfo=timezone.utc)  # 2026-10-29.0 TT
+TP_JD_TT = 2474037.5843
+Q_AU = 0.570882
+ECCENTRICITY = 0.968034
+INCLINATION_DEG = 162.1929
+ASCENDING_NODE_DEG = 59.2521
+ARGUMENT_PERIHELION_DEG = 112.1528
+MU_S_KM3_S2 = 1.327e11  # Professor's assigned solar gravitational parameter
+AU_KM = 149_597_870.7  # IAU exact definition
+SECONDS_PER_DAY = 86_400.0
+J2000_JD_AT_MIDNIGHT = 2_451_544.5
+
+
+def julian_date_tt(dt: datetime) -> float:
+    """Return Julian Date for a naive/UTC-like datetime interpreted as TT."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    j2000 = datetime(2000, 1, 1)
+    return J2000_JD_AT_MIDNIGHT + (dt - j2000).total_seconds() / SECONDS_PER_DAY
+
+
+def datetime_from_jd_tt(jd: float) -> datetime:
+    """Return a UTC-naive calendar value for a Julian Date interpreted as TT."""
+    return datetime(2000, 1, 1) + timedelta(days=jd - J2000_JD_AT_MIDNIGHT)
+
+
+def wrap_pi(angle: float) -> float:
+    """Wrap radians to [-pi, pi)."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+A_AU = Q_AU / (1.0 - ECCENTRICITY)
+A_KM = A_AU * AU_KM
+N_RAD_S = math.sqrt(MU_S_KM3_S2 / A_KM**3)
+N_RAD_DAY = N_RAD_S * SECONDS_PER_DAY
+PERIOD_DAYS = 2.0 * math.pi / N_RAD_DAY
+PERIOD_JULIAN_YEARS = PERIOD_DAYS / 365.25
+
+
+def solve_kepler(mean_anomaly_rad: float, iterations: int = 8) -> tuple[float, float]:
+    """Solve E - e sin(E) = M by Newton-Raphson; return E and residual."""
+    m = wrap_pi(mean_anomaly_rad)
+    e_anomaly = m + 0.85 * ECCENTRICITY * (1.0 if m >= 0.0 else -1.0)
+    for _ in range(iterations):
+        f = e_anomaly - ECCENTRICITY * math.sin(e_anomaly) - m
+        fp = 1.0 - ECCENTRICITY * math.cos(e_anomaly)
+        e_anomaly -= f / fp
+    residual = e_anomaly - ECCENTRICITY * math.sin(e_anomaly) - m
+    return e_anomaly, residual
+
+
+def position(dt: datetime, sample_type: str) -> dict[str, object]:
+    """Compute one heliocentric position in the requested ecliptic frame."""
+    jd = julian_date_tt(dt)
+    days_from_perihelion = jd - TP_JD_TT
+    mean_anomaly = wrap_pi(N_RAD_DAY * days_from_perihelion)
+    eccentric_anomaly, residual = solve_kepler(mean_anomaly)
+
+    xp = A_AU * (math.cos(eccentric_anomaly) - ECCENTRICITY)
+    yp = A_AU * math.sqrt(1.0 - ECCENTRICITY**2) * math.sin(eccentric_anomaly)
+    radius = A_AU * (1.0 - ECCENTRICITY * math.cos(eccentric_anomaly))
+
+    inc = math.radians(INCLINATION_DEG)
+    node = math.radians(ASCENDING_NODE_DEG)
+    argp = math.radians(ARGUMENT_PERIHELION_DEG)
+    ci, si = math.cos(inc), math.sin(inc)
+    co, so = math.cos(node), math.sin(node)
+    cw, sw = math.cos(argp), math.sin(argp)
+
+    # Column-vector rotation Rz(Omega) Rx(i) Rz(omega), as specified.
+    x = xp * (co * cw - so * ci * sw) + yp * (-co * sw - so * ci * cw)
+    y = xp * (so * cw + co * ci * sw) + yp * (-so * sw + co * ci * cw)
+    z = xp * (si * sw) + yp * (si * cw)
+
+    return {
+        "sample_type": sample_type,
+        "date_tt": dt.isoformat(sep=" ", timespec="microseconds").rstrip("0").rstrip("."),
+        "jd_tt": jd,
+        "days_from_Tp": days_from_perihelion,
+        "M_rad": mean_anomaly,
+        "E_rad": eccentric_anomaly,
+        "kepler_residual_rad": residual,
+        "x_perifocal_AU": xp,
+        "y_perifocal_AU": yp,
+        "X_HE_AU": x,
+        "Y_HE_AU": y,
+        "Z_HE_AU": z,
+        "r_AU": radius,
+        "norm_error_AU": abs(math.sqrt(x * x + y * y + z * z) - radius),
+    }
+
+
+def build_samples() -> list[dict[str, object]]:
+    annual = [position(datetime(year, 10, 30), "Annual") for year in range(2026, 2067)]
+    annual_jds = [float(row["jd_tt"]) for row in annual]
+    tp_dt = datetime_from_jd_tt(TP_JD_TT)
+    refined: list[dict[str, object]] = []
+    for k in range(-17, 18):
+        dt = tp_dt + timedelta(days=7 * k)
+        jd = julian_date_tt(dt)
+        if min(abs(jd - annual_jd) for annual_jd in annual_jds) < 2.0:
+            continue
+        refined.append(position(dt, "Perihelion-refined"))
+    refined.append(position(tp_dt, "Perihelion (Tp)"))
+
+    # Monthly path points keep the long trajectory legible without obscuring
+    # the denser weekly samples around perihelion. Remove monthly points in a
+    # 150-day perihelion window; annual and refined points cover that segment.
+    start = datetime(2026, 10, 30)
+    end = datetime(2066, 10, 30)
+    monthly: list[dict[str, object]] = []
+    step = 0
+    while start + timedelta(days=30 * step) <= end:
+        dt = start + timedelta(days=30 * step)
+        jd = julian_date_tt(dt)
+        if abs(jd - TP_JD_TT) >= 150.0:
+            monthly.append(position(dt, "Trajectory path"))
+        step += 1
+    return sorted(annual + refined + monthly, key=lambda row: float(row["jd_tt"]))
+
+
+def write_outputs(output_dir: Path) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = build_samples()
+    annual = [row for row in rows if row["sample_type"] == "Annual"]
+    refined = [row for row in rows if row["sample_type"] in ("Perihelion-refined", "Perihelion (Tp)")]
+
+    csv_path = output_dir / "halley_positions.csv"
+    fields = list(rows[0].keys())
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    peri = next(row for row in rows if row["sample_type"] == "Perihelion (Tp)")
+    epoch_jd = julian_date_tt(ELEMENT_EPOCH)
+    mean_anomaly_at_epoch = (N_RAD_DAY * (epoch_jd - TP_JD_TT)) % (2.0 * math.pi)
+    summary = {
+        "model": "Two-body Kepler propagation; fixed osculating elements",
+        "source_url": SOURCE_URL,
+        "mpc_format_url": MPC_FORMAT_URL,
+        "source_retrieved": SOURCE_RETRIEVED,
+        "element_epoch_tt": "2026-10-29 00:00:00 TT",
+        "mean_anomaly_at_element_epoch_deg": math.degrees(mean_anomaly_at_epoch),
+        "perihelion_jd_tt": TP_JD_TT,
+        "perihelion_calendar_tt_from_jd": datetime_from_jd_tt(TP_JD_TT).isoformat(sep=" ", timespec="microseconds"),
+        "perihelion_time_note": "COBS also shows 2061-08-01 02:00:14 without labeling its time scale; the calculation anchors to JD 2474037.5843 and applies the MPC TT convention.",
+        "q_source_au": Q_AU,
+        "a_derived_au": A_AU,
+        "e_source": ECCENTRICITY,
+        "mu_s_km3_s2": MU_S_KM3_S2,
+        "au_km_exact": AU_KM,
+        "n_rad_s": N_RAD_S,
+        "period_days": PERIOD_DAYS,
+        "period_julian_years": PERIOD_JULIAN_YEARS,
+        "annual_count": len(annual),
+        "perihelion_refined_count_including_Tp": len(refined),
+        "trajectory_path_count": sum(row["sample_type"] == "Trajectory path" for row in rows),
+        "total_sample_count": len(rows),
+        "annual_interval_days": float(annual[-1]["jd_tt"]) - float(annual[0]["jd_tt"]),
+        "max_abs_kepler_residual_rad": max(abs(float(row["kepler_residual_rad"])) for row in rows),
+        "max_xyz_norm_error_au": max(float(row["norm_error_AU"]) for row in rows),
+        "r_at_Tp_au": float(peri["r_AU"]),
+        "annual_first": annual[0],
+        "annual_last": annual[-1],
+    }
+    summary_path = output_dir / "calculation_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
+
+# Figure controls. These change the view, not the orbit or its source data.
+VIEW_ELEVATION = 25
+VIEW_AZIMUTH = 45
+OUTPUT_FOLDER = "Halley_Figures"
+
+
+def generate_figures():
+    """Generate two 3D views and a Newton convergence figure."""
+    import zipfile
+    import matplotlib
+    try:
+        from google.colab import files as colab_files
+    except ImportError:
+        colab_files = None
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 16,
+        "axes.labelcolor": "#14243A",
+        "text.color": "#14243A",
+        "axes.edgecolor": "#8794A1",
+        "xtick.color": "#526272",
+        "ytick.color": "#526272",
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "svg.fonttype": "path",
+        "axes.unicode_minus": True,
+    })
+    out = Path(OUTPUT_FOLDER)
+    out.mkdir(parents=True, exist_ok=True)
+    summary = write_outputs(out)
+    rows = build_samples()
+    annual = [r for r in rows if r["sample_type"] == "Annual"]
+    refined = [r for r in rows if r["sample_type"] in ("Perihelion-refined", "Perihelion (Tp)")]
+    peri = next(r for r in refined if r["sample_type"] == "Perihelion (Tp)")
+    annual_2061 = next(r for r in annual if str(r["date_tt"]).startswith("2061-"))
+    assert len(annual) == 41 and len(refined) == 35
+    assert summary["annual_interval_days"] == 14610
+    assert summary["max_abs_kepler_residual_rad"] < 1e-12
+    assert summary["max_xyz_norm_error_au"] < 1e-11
+
+    def xyz(points):
+        return tuple([float(r[k]) for r in points] for k in ("X_HE_AU", "Y_HE_AU", "Z_HE_AU"))
+
+    def ordered_unique(points):
+        # Sort the perihelion view too: this avoids drawing backwards after
+        # inserting the annual October 2061 point among the weekly samples.
+        by_jd = {float(r["jd_tt"]): r for r in points}
+        return [by_jd[jd] for jd in sorted(by_jd)]
+
+    def set_limits(ax, points):
+        spans = []
+        for values, setter in zip(xyz(points), (ax.set_xlim, ax.set_ylim, ax.set_zlim)):
+            values = values + [0.0]  # The Sun must remain in the view.
+            lo, hi = min(values), max(values)
+            span = max(hi - lo, 0.1)
+            pad = 0.10 * span
+            setter(lo - pad, hi + pad)
+            spans.append(span + 2 * pad)
+        # Same physical scale in all three directions: one AU has the same
+        # plotted length before the perspective projection.
+        ax.set_box_aspect(spans)
+
+    def draw_3d(points, annual_points, refined_points, title, subtitle, stem):
+        points = ordered_unique(points)
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot(*xyz(points), color="#276C92", lw=1.8, label="Two-body trajectory")
+        if annual_points:
+            ax.scatter(*xyz(annual_points), s=27, c="#008C95", edgecolors="white",
+                       linewidths=.5, depthshade=False, label="Annual positions")
+        if refined_points:
+            ax.scatter(*xyz(refined_points), s=21, c="#D59636", edgecolors="white",
+                       linewidths=.4, depthshade=False, label="Perihelion samples")
+        ax.scatter(0, 0, 0, s=115, c="#F2BD44", edgecolors="#9E6A14",
+                   linewidths=.7, depthshade=False, label="Sun")
+        ax.scatter(float(peri["X_HE_AU"]), float(peri["Y_HE_AU"]), float(peri["Z_HE_AU"]),
+                   s=55, marker="D", c="#A43B3B", edgecolors="white", linewidths=.5,
+                   depthshade=False, label="Exact source Tp")
+        set_limits(ax, points)
+        ax.view_init(elev=VIEW_ELEVATION, azim=VIEW_AZIMUTH)
+        ax.set_xlabel(r"$X_{\rm HE}$ (AU)", labelpad=12)
+        ax.set_ylabel(r"$Y_{\rm HE}$ (AU)", labelpad=12)
+        ax.set_zlabel(r"$Z_{\rm HE}$ (AU)", labelpad=10)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_major_locator(MaxNLocator(nbins=5))
+            axis.pane.set_facecolor((1, 1, 1, 1))
+            axis.pane.set_edgecolor("#D8E0E5")
+            axis._axinfo["grid"].update({"color": "#DDE4E9", "linewidth": .6})
+        fig.suptitle(title, x=.5, y=.962, fontsize=17, fontweight="bold")
+        fig.text(.5, .914, subtitle, ha="center", fontsize=11, color="#526272")
+        fig.legend(*ax.get_legend_handles_labels(), loc="lower center", bbox_to_anchor=(.5, .053),
+                   ncol=3, frameon=False, fontsize=10)
+        fig.text(.5, .022, "J2000 ecliptic frame, dates in TT. Fixed elements and two-body solar gravity.",
+                 ha="center", fontsize=9, color="#647181")
+        fig.subplots_adjust(left=.04, right=.94, top=.89, bottom=.16)
+        fig.savefig(out / f"{stem}.png", dpi=300)
+        fig.savefig(out / f"{stem}.svg")
+        if colab_files is not None:
+            plt.show()
+        plt.close(fig)
+
+    draw_3d(rows, annual, refined,
+            "1P/Halley: heliocentric trajectory, 2026–2066",
+            "41 annual epochs from 30 October 2026 to 30 October 2066, with refined perihelion sampling",
+            "Halley_3D_full_trajectory")
+    zoom = ordered_unique(refined + [annual_2061])
+    draw_3d(zoom, [annual_2061], refined,
+            "1P/Halley: the 2061 perihelion passage",
+            "Weekly samples around source Tp; annual point at 30 October 2061. Perihelion distance = 0.570882 AU.",
+            "Halley_3D_perihelion")
+
+    # Newton convergence at the same first annual epoch as slide 6.
+    m = float(annual[0]["M_rad"])
+    estimate = m + .85 * ECCENTRICITY * (1 if m >= 0 else -1)
+    estimates, residuals = [], []
+    for k in range(9):
+        estimates.append(estimate)
+        residual = estimate - ECCENTRICITY * math.sin(estimate) - m
+        residuals.append(abs(residual))
+        if k < 8:
+            estimate -= residual / (1 - ECCENTRICITY * math.cos(estimate))
+    assert abs(estimates[-1] - float(annual[0]["E_rad"])) < 1e-13
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(range(9), estimates, "o-", c="#276C92", lw=2, ms=6,
+            markerfacecolor="white", markeredgewidth=1.5)
+    ax.set(title="Newton convergence at 30 October 2026", xlabel="Newton iteration k",
+           ylabel="Eccentric anomaly E (rad)")
+    ax.set_xticks(range(9))
+    ax.grid(True, color="#DDE4E9", lw=.7)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.text(.5, .025, "Each point is the next Newton estimate for one date. Eight updates follow the starting estimate.",
+             ha="center", fontsize=10, color="#647181")
+    fig.tight_layout(rect=(0, .07, 1, 1))
+    fig.savefig(out / "Halley_Newton_convergence.png", dpi=300)
+    fig.savefig(out / "Halley_Newton_convergence.svg")
+    if colab_files is not None:
+        plt.show()
+    plt.close(fig)
+    with (out / "newton_iterations.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["iteration", "E_rad", "absolute_residual_rad"])
+        writer.writerows(zip(range(9), estimates, residuals))
+    (out / "README.txt").write_text(
+        "Halley figure generator\n\n"
+        "PNG files are ready to insert into PowerPoint. SVG files preserve vector quality.\n"
+        "The 3D plots use all three computed HE coordinates and the same orbit data as the assignment.\n"
+        "The plotting style has numeric 3D axes and may look different from the editable slide drawings.\n"
+        "Blue: trajectory; teal: annual positions; amber: refined samples; gold: Sun; red: source Tp.\n"
+        "Each axis is in AU with equal physical unit scale. Dates are TT.\n"
+        "Main interval: 2026-10-30 00:00 TT to 2066-10-30 00:00 TT; 41 annual positions.\n"
+        "The model freezes the source elements and includes only solar two-body gravity.\n"
+        "It omits planetary perturbations and cometary non-gravitational forces.\n\n"
+        "Source: COBS/MPC record MPC191592, source epoch 2026-10-29.0 TT.\n"
+        "https://www.cobs.si/comet/479/\n"
+        "https://docs.minorplanetcenter.net/mpc-ops-docs/orbits/comet-orbit-format/\n"
+        "Assigned mu_s = 1.327e11 km^3/s^2; exact AU = 149597870.7 km.\n"
+        "Tp = JD 2474037.5843 TT. For the source clock/JD note see calculation_summary.json.\n",
+        encoding="utf-8")
+    archive = out.with_suffix(".zip")
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(out.iterdir()):
+            if p.is_file():
+                z.write(p, p.name)
+    print(f"Done: three figures saved as PNG and SVG in {out.resolve()}")
+    print(f"Results archive: {archive.resolve()}")
+    print("Validation: 41 annual points; 35 refined perihelion samples; unchanged two-body calculations.")
+    if colab_files is not None:
+        print("Starting the ZIP download. If needed, download it from Colab's Files panel on the left.")
+        colab_files.download(str(archive))
+    return summary
+
+
+if __name__ == "__main__":
+    generate_figures()
